@@ -183,6 +183,26 @@ def _clean_text(text: Any) -> str:
     return " ".join(str(text or "").split())
 
 
+DISPLAY_TERM_REPLACEMENTS = {
+    "child_support": "양육비",
+    "parental_rights": "친권·양육 책임",
+    "property_division": "재산분할",
+    "financial_conflict": "금전 갈등",
+    "agreement_note": "각서·합의서",
+    "divorce_ground": "이혼 사유",
+    "affair_compensation": "상간자 위자료",
+    "wife": "아내",
+    "husband": "남편",
+}
+
+
+def _sanitize_display_terms(text: Any) -> str:
+    value = _clean_text(text)
+    for raw, display in DISPLAY_TERM_REPLACEMENTS.items():
+        value = value.replace(raw, display)
+    return value
+
+
 def _first_claim(result: dict) -> dict:
     claims = result.get("claims") or []
     return claims[0] if claims and isinstance(claims[0], dict) else {}
@@ -202,27 +222,62 @@ def _evidence_lookup(evidence_items: list) -> dict[str, dict]:
 
 
 def _compact_evidence_label(item: dict) -> str:
+    raw = _clean_text(item.get("raw_quote", ""))
+    summary = _clean_text(item.get("summary", ""))
+    text = f"{raw} {summary}"
+    if item.get("doc_type") == "agreement_note" or "각서" in raw:
+        return "자필 각서"
+    if "학원" in raw or "교육" in raw:
+        return "자녀 교육비 자료"
+    if "제주" in raw or "출장" in raw:
+        return "제주도 여행 대화"
+    if "호텔" in raw or "모텔" in raw or "숙박" in raw or "대실" in raw:
+        return "숙박·호텔 지출 자료"
+    if "샤넬" in raw or "디올" in raw or "프라다" in raw or "명품" in raw:
+        return "명품 구매 카드내역"
+    if "와인바" in raw or "유흥" in raw:
+        return "유흥 지출 카드내역"
+    if item.get("doc_type") == "agreement_note" or "각서" in text:
+        return "자필 각서"
+    if "학원" in text or "교육" in text:
+        return "자녀 교육비 자료"
+    if "제주" in text or "출장" in text:
+        return "제주도 여행 대화"
+    if "호텔" in text or "모텔" in text or "숙박" in text or "대실" in text:
+        return "숙박·호텔 지출 자료"
+    if "샤넬" in text or "디올" in text or "프라다" in text or "명품" in text:
+        return "명품 구매 카드내역"
+    if "와인바" in text or "유흥" in text:
+        return "유흥 지출 카드내역"
+    if item.get("doc_type") == "chat_capture":
+        return "카톡 대화"
+    if item.get("doc_type") == "card_statement":
+        return "카드명세서"
+    if item.get("doc_type") == "receipt":
+        return "영수증"
     source = {
         "card_statement": "카드명세서",
         "receipt": "영수증",
         "chat_capture": "카톡 캡처",
         "agreement_note": "각서",
     }.get(item.get("doc_type"), "근거 자료")
-    quote = _clean_text(item.get("raw_quote") or item.get("summary"))
-    return f"{source}: {_short_text(quote, 54)}" if quote else source
+    return source
 
 
 def _replace_evidence_ids(text: Any, evidence_by_id: dict[str, dict]) -> str:
     value = _clean_text(text)
     if not value:
         return ""
-
-    def replace(match: re.Match) -> str:
-        evidence_id = match.group(0)
-        item = evidence_by_id.get(evidence_id)
-        return _compact_evidence_label(item) if item else evidence_id
-
-    return re.sub(r"E\d{3}", replace, value)
+    value = re.sub(r"\((?:\s*E\d{3}\s*,?\s*)+\)", "", value)
+    value = re.sub(r"E\d{3}(?:\s*(?:,|과|와|및)\s*E\d{3})*(?:의|에서|에는|은|는|을|를)?\s*", "", value)
+    value = re.sub(r"\s{2,}", " ", value)
+    value = value.replace(": 등 ", ": ")
+    value = value.replace("( 등 ", "(")
+    value = value.replace(" 등 핵심", " 핵심")
+    value = value.replace("각서 각서", "각서")
+    value = value.replace("대화의 대화", "대화")
+    value = value.replace("자료 자료", "자료")
+    return _sanitize_display_terms(value)
 
 
 def _evidence_suffix(evidence_ids: list, evidence_by_id: dict[str, dict]) -> str:
@@ -231,7 +286,27 @@ def _evidence_suffix(evidence_ids: list, evidence_by_id: dict[str, dict]) -> str
         for eid in [str(item) for item in evidence_ids or [] if item]
         if eid in evidence_by_id
     ]
-    return f"\n근거 자료: {' / '.join(labels[:4])}" if labels else ""
+    deduped = list(dict.fromkeys(labels))
+    return f"\n핵심 근거: {', '.join(deduped[:3])}" if deduped else ""
+
+
+def _sentence_limited(text: Any, max_sentences: int = 2) -> str:
+    value = _sanitize_display_terms(text)
+    if not value:
+        return ""
+    sentences = re.findall(r".+?(?:다\.|요\.|니다\.|습니다\.|[.!?])(?:\s+|$)", value)
+    if len(sentences) >= max_sentences:
+        return " ".join(sentence.strip() for sentence in sentences[:max_sentences])
+    return value
+
+
+def _ensure_sentence(text: Any, ending: str = "가 핵심 쟁점입니다.") -> str:
+    value = _clean_text(text)
+    if not value:
+        return ""
+    if re.search(r"(다\.|요\.|니다\.|습니다\.|[.!?])$", value):
+        return value
+    return value + ending
 
 
 def _claim_to_chat_card(
@@ -246,7 +321,7 @@ def _claim_to_chat_card(
     return {
         "role": role,
         "label": label,
-        "text": _replace_evidence_ids(text or fallback, evidence_by_id)
+        "text": _sentence_limited(_replace_evidence_ids(text or fallback, evidence_by_id), 2)
         + _evidence_suffix(evidence_ids, evidence_by_id),
         "evidence_ids": evidence_ids,
         "stance": "opening",
@@ -264,7 +339,7 @@ def _message_to_chat_card(message: dict, fallback_role: str, evidence_by_id: dic
         "clarification": "쟁점 정리",
         "missing_evidence": "추가 증거 필요",
     }.get(stance, "반박")
-    content = _replace_evidence_ids(message.get("content", ""), evidence_by_id)
+    content = _sentence_limited(_replace_evidence_ids(message.get("content", ""), evidence_by_id), 2)
     text = f"{prefix}: {content}{_evidence_suffix(evidence_ids, evidence_by_id)}"
     return {
         "role": role,
@@ -279,7 +354,11 @@ def _message_to_chat_card(message: dict, fallback_role: str, evidence_by_id: dic
 
 def _join_limited(items: list, limit: int = 3, evidence_by_id: dict[str, dict] | None = None) -> str:
     evidence_by_id = evidence_by_id or {}
-    values = [_replace_evidence_ids(item, evidence_by_id) for item in items or [] if _clean_text(item)]
+    values = [
+        _sentence_limited(_replace_evidence_ids(item, evidence_by_id), 1)
+        for item in items or []
+        if _clean_text(item)
+    ]
     return " ".join(f"{idx + 1}. {item}" for idx, item in enumerate(values[:limit]))
 
 
@@ -291,18 +370,21 @@ def _mediator_long_advice(
     evidence_by_id = evidence_by_id or {}
     parts = []
     if mediator_result.get("core_problem"):
-        parts.append(f"핵심 문제는 {_replace_evidence_ids(mediator_result['core_problem'], evidence_by_id)}")
+        core_problem = _ensure_sentence(
+            _sentence_limited(_replace_evidence_ids(mediator_result["core_problem"], evidence_by_id), 1)
+        )
+        parts.append(f"핵심 문제는 {core_problem}")
     if mediator_result.get("reasoning"):
-        parts.append(f"제가 보는 방향은 이렇습니다. {_replace_evidence_ids(mediator_result['reasoning'], evidence_by_id)}")
+        parts.append(f"제가 보는 방향은 이렇습니다. {_sentence_limited(_replace_evidence_ids(mediator_result['reasoning'], evidence_by_id), 2)}")
     if mediator_result.get("debate_summary"):
-        parts.append(f"양측 주장을 정리하면 {_replace_evidence_ids(mediator_result['debate_summary'], evidence_by_id)}")
+        parts.append(f"양측 주장을 정리하면 {_sentence_limited(_replace_evidence_ids(mediator_result['debate_summary'], evidence_by_id), 2)}")
     calm_points = _join_limited(mediator_result.get("points_to_calm_down", []), 2, evidence_by_id)
     if calm_points:
         parts.append(f"지금 당장 진정해야 할 지점은 {calm_points}")
-    next_actions = _join_limited(mediator_result.get("next_actions", []), 4, evidence_by_id)
+    next_actions = _join_limited(mediator_result.get("next_actions", []), 3, evidence_by_id)
     if next_actions:
         parts.append(f"다음 행동은 {next_actions}")
-    financial = _join_limited(mediator_result.get("financial_guidelines", []), 3, evidence_by_id)
+    financial = _join_limited(mediator_result.get("financial_guidelines", []), 2, evidence_by_id)
     if financial:
         parts.append(f"돈 문제는 {financial}")
     warnings = _join_limited(mediator_result.get("warning_signs", []), 2, evidence_by_id)
@@ -360,7 +442,7 @@ def _discussion_chat_cards(
     cards.append(
         {
             "role": "mediator",
-            "label": mediator_result.get("display_name") or "서장훈 에이전트",
+            "label": "서장훈 에이전트",
             "text": _mediator_long_advice(mediator_result, realistic_advice, evidence_by_id),
             "stance": "mediation",
         }
@@ -395,10 +477,11 @@ def _legal_basis_lookup() -> dict[str, str]:
     }
 
 
-def _judge_preview_text(judge_result: dict) -> str:
+def _judge_preview_text(judge_result: dict, evidence_by_id: dict[str, dict] | None = None) -> str:
+    evidence_by_id = evidence_by_id or {}
     issues = judge_result.get("issue_analysis", [])
     if not issues:
-        return _clean_text(judge_result.get("summary") or "법적 쟁점을 정리하고 있습니다.")
+        return _sanitize_display_terms(judge_result.get("summary") or "법적 쟁점을 정리하고 있습니다.")
 
     legal_by_id = _legal_basis_lookup()
     legal_ids = []
@@ -417,7 +500,10 @@ def _judge_preview_text(judge_result: dict) -> str:
     issue_lines = []
     for issue in issues[:3]:
         title = issue.get("issue_title") or issue.get("issue_type") or "법적 쟁점"
-        analysis = _clean_text(issue.get("analysis") or issue.get("wife_position") or issue.get("husband_position"))
+        analysis = _sentence_limited(
+            _replace_evidence_ids(issue.get("analysis") or issue.get("wife_position") or issue.get("husband_position"), evidence_by_id),
+            2,
+        )
         if analysis:
             issue_lines.append(f"{title}: {analysis}")
 
@@ -426,16 +512,29 @@ def _judge_preview_text(judge_result: dict) -> str:
     return prefix + " ".join(issue_lines)
 
 
-def _discussion_result_text(agent_discussion: dict, judge_result: dict) -> str:
-    disputes = [_clean_text(item) for item in agent_discussion.get("remaining_disputes", []) if _clean_text(item)]
-    missing = [_clean_text(item) for item in agent_discussion.get("missing_evidence", []) if _clean_text(item)]
+def _discussion_result_text(
+    agent_discussion: dict,
+    judge_result: dict,
+    evidence_by_id: dict[str, dict] | None = None,
+) -> str:
+    evidence_by_id = evidence_by_id or {}
+    disputes = [
+        _sentence_limited(_replace_evidence_ids(item, evidence_by_id), 1)
+        for item in agent_discussion.get("remaining_disputes", [])
+        if _clean_text(item)
+    ]
+    missing = [
+        _sentence_limited(_replace_evidence_ids(item, evidence_by_id), 1)
+        for item in agent_discussion.get("missing_evidence", [])
+        if _clean_text(item)
+    ]
     parts = []
     if disputes:
-        parts.append("남은 쟁점: " + " / ".join(disputes[:5]))
+        parts.append("남은 쟁점: " + " / ".join(disputes[:4]))
     if missing:
-        parts.append("추가 확인 자료: " + " / ".join(missing[:4]))
+        parts.append("추가 확인 자료: " + " / ".join(missing[:3]))
     if judge_result.get("summary"):
-        parts.append("판사 쟁점 정리: " + _clean_text(judge_result.get("summary")))
+        parts.append("판사 쟁점 정리: " + _sentence_limited(_replace_evidence_ids(judge_result.get("summary"), evidence_by_id), 2))
     return "\n".join(parts) or "양측 주장과 반박을 종합했습니다."
 
 
@@ -504,11 +603,11 @@ def build_frontend_flow(
             ),
             "judge_preview": {
                 "label": "가정법원 판사",
-                "text": _judge_preview_text(judge_result),
+                "text": _judge_preview_text(judge_result, evidence_by_id),
             },
             "discussion_result": {
                 "label": "토론 결과",
-                "text": _discussion_result_text(agent_discussion, judge_result),
+                "text": _discussion_result_text(agent_discussion, judge_result, evidence_by_id),
             },
         },
         "day4": {
