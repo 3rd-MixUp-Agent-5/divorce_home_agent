@@ -185,7 +185,9 @@ def _clean_text(text: Any) -> str:
 
 DISPLAY_TERM_REPLACEMENTS = {
     "child_support": "양육비",
+    "child support": "양육비",
     "parental_rights": "친권·양육 책임",
+    "parental rights": "친권·양육 책임",
     "property_division": "재산분할",
     "financial_conflict": "금전 갈등",
     "agreement_note": "각서·합의서",
@@ -200,6 +202,10 @@ def _sanitize_display_terms(text: Any) -> str:
     value = _clean_text(text)
     for raw, display in DISPLAY_TERM_REPLACEMENTS.items():
         value = value.replace(raw, display)
+    value = value.replace("남편가", "남편이")
+    value = value.replace("아내가", "아내가")
+    value = value.replace("갈등가", "갈등이")
+    value = value.replace("쟁점가", "쟁점이")
     return value
 
 
@@ -306,7 +312,7 @@ def _ensure_sentence(text: Any, ending: str = "가 핵심 쟁점입니다.") -> 
         return ""
     if re.search(r"(다\.|요\.|니다\.|습니다\.|[.!?])$", value):
         return value
-    return value + ending
+    return _sanitize_display_terms(value + ending)
 
 
 def _claim_to_chat_card(
