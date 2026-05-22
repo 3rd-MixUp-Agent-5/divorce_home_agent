@@ -1,4 +1,5 @@
 from collections import defaultdict
+import re
 from typing import Any
 
 from agents import husband_lawyer_agent, judge_agent, mediator_agent, wife_lawyer_agent
@@ -178,6 +179,10 @@ def _short_text(text: Any, limit: int = 95) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
+def _clean_text(text: Any) -> str:
+    return " ".join(str(text or "").split())
+
+
 def _first_claim(result: dict) -> dict:
     claims = result.get("claims") or []
     return claims[0] if claims and isinstance(claims[0], dict) else {}
@@ -192,24 +197,63 @@ def _role_from_speaker(speaker: Any, fallback: str = "wife_lawyer") -> str:
     return fallback
 
 
-def _evidence_suffix(evidence_ids: list) -> str:
-    ids = [str(item) for item in evidence_ids or [] if item]
-    return f" 근거: {', '.join(ids[:3])}" if ids else ""
+def _evidence_lookup(evidence_items: list) -> dict[str, dict]:
+    return {str(item.get("evidence_id")): item for item in evidence_items if item.get("evidence_id")}
 
 
-def _claim_to_chat_card(role: str, label: str, claim: dict, fallback: str) -> dict:
+def _compact_evidence_label(item: dict) -> str:
+    source = {
+        "card_statement": "카드명세서",
+        "receipt": "영수증",
+        "chat_capture": "카톡 캡처",
+        "agreement_note": "각서",
+    }.get(item.get("doc_type"), "근거 자료")
+    quote = _clean_text(item.get("raw_quote") or item.get("summary"))
+    return f"{source}: {_short_text(quote, 54)}" if quote else source
+
+
+def _replace_evidence_ids(text: Any, evidence_by_id: dict[str, dict]) -> str:
+    value = _clean_text(text)
+    if not value:
+        return ""
+
+    def replace(match: re.Match) -> str:
+        evidence_id = match.group(0)
+        item = evidence_by_id.get(evidence_id)
+        return _compact_evidence_label(item) if item else evidence_id
+
+    return re.sub(r"E\d{3}", replace, value)
+
+
+def _evidence_suffix(evidence_ids: list, evidence_by_id: dict[str, dict]) -> str:
+    labels = [
+        _compact_evidence_label(evidence_by_id[eid])
+        for eid in [str(item) for item in evidence_ids or [] if item]
+        if eid in evidence_by_id
+    ]
+    return f"\n근거 자료: {' / '.join(labels[:4])}" if labels else ""
+
+
+def _claim_to_chat_card(
+    role: str,
+    label: str,
+    claim: dict,
+    fallback: str,
+    evidence_by_id: dict[str, dict],
+) -> dict:
     evidence_ids = claim.get("evidence_ids", []) if isinstance(claim, dict) else []
     text = claim.get("claim") if isinstance(claim, dict) else ""
     return {
         "role": role,
         "label": label,
-        "text": _short_text((text or fallback) + _evidence_suffix(evidence_ids), 120),
+        "text": _replace_evidence_ids(text or fallback, evidence_by_id)
+        + _evidence_suffix(evidence_ids, evidence_by_id),
         "evidence_ids": evidence_ids,
         "stance": "opening",
     }
 
 
-def _message_to_chat_card(message: dict, fallback_role: str) -> dict:
+def _message_to_chat_card(message: dict, fallback_role: str, evidence_by_id: dict[str, dict]) -> dict:
     role = _role_from_speaker(message.get("speaker"), fallback_role)
     label = "남편 측 변호사" if role == "husband_lawyer" else "아내 측 변호사"
     evidence_ids = message.get("evidence_ids", [])
@@ -220,11 +264,12 @@ def _message_to_chat_card(message: dict, fallback_role: str) -> dict:
         "clarification": "쟁점 정리",
         "missing_evidence": "추가 증거 필요",
     }.get(stance, "반박")
-    text = f"{prefix}: {message.get('content', '')}{_evidence_suffix(evidence_ids)}"
+    content = _replace_evidence_ids(message.get("content", ""), evidence_by_id)
+    text = f"{prefix}: {content}{_evidence_suffix(evidence_ids, evidence_by_id)}"
     return {
         "role": role,
         "label": label,
-        "text": _short_text(text, 125),
+        "text": text,
         "evidence_ids": evidence_ids,
         "stance": stance,
         "strength": message.get("strength"),
@@ -232,18 +277,66 @@ def _message_to_chat_card(message: dict, fallback_role: str) -> dict:
     }
 
 
+def _join_limited(items: list, limit: int = 3, evidence_by_id: dict[str, dict] | None = None) -> str:
+    evidence_by_id = evidence_by_id or {}
+    values = [_replace_evidence_ids(item, evidence_by_id) for item in items or [] if _clean_text(item)]
+    return " ".join(f"{idx + 1}. {item}" for idx, item in enumerate(values[:limit]))
+
+
+def _mediator_long_advice(
+    mediator_result: dict,
+    fallback: str,
+    evidence_by_id: dict[str, dict] | None = None,
+) -> str:
+    evidence_by_id = evidence_by_id or {}
+    parts = []
+    if mediator_result.get("core_problem"):
+        parts.append(f"핵심 문제는 {_replace_evidence_ids(mediator_result['core_problem'], evidence_by_id)}")
+    if mediator_result.get("reasoning"):
+        parts.append(f"제가 보는 방향은 이렇습니다. {_replace_evidence_ids(mediator_result['reasoning'], evidence_by_id)}")
+    if mediator_result.get("debate_summary"):
+        parts.append(f"양측 주장을 정리하면 {_replace_evidence_ids(mediator_result['debate_summary'], evidence_by_id)}")
+    calm_points = _join_limited(mediator_result.get("points_to_calm_down", []), 2, evidence_by_id)
+    if calm_points:
+        parts.append(f"지금 당장 진정해야 할 지점은 {calm_points}")
+    next_actions = _join_limited(mediator_result.get("next_actions", []), 4, evidence_by_id)
+    if next_actions:
+        parts.append(f"다음 행동은 {next_actions}")
+    financial = _join_limited(mediator_result.get("financial_guidelines", []), 3, evidence_by_id)
+    if financial:
+        parts.append(f"돈 문제는 {financial}")
+    warnings = _join_limited(mediator_result.get("warning_signs", []), 2, evidence_by_id)
+    if warnings:
+        parts.append(f"주의할 점은 {warnings}")
+    return "\n\n".join(parts) or _replace_evidence_ids(fallback, evidence_by_id)
+
+
 def _discussion_chat_cards(
+    evidence_items: list,
     wife_result: dict,
     husband_result: dict,
     agent_discussion: dict,
     mediator_result: dict,
     realistic_advice: str,
 ) -> list[dict]:
+    evidence_by_id = _evidence_lookup(evidence_items)
     wife_claim = _first_claim(wife_result)
     husband_claim = _first_claim(husband_result)
     cards = [
-        _claim_to_chat_card("wife_lawyer", "아내 측 변호사", wife_claim, wife_result.get("summary", "")),
-        _claim_to_chat_card("husband_lawyer", "남편 측 변호사", husband_claim, husband_result.get("summary", "")),
+        _claim_to_chat_card(
+            "wife_lawyer",
+            "아내 측 변호사",
+            wife_claim,
+            wife_result.get("summary", ""),
+            evidence_by_id,
+        ),
+        _claim_to_chat_card(
+            "husband_lawyer",
+            "남편 측 변호사",
+            husband_claim,
+            husband_result.get("summary", ""),
+            evidence_by_id,
+        ),
     ]
 
     wife_messages = []
@@ -257,28 +350,93 @@ def _discussion_chat_cards(
         else:
             wife_messages.append(message)
 
-    for idx in range(max(len(wife_messages), len(husband_messages))):
+    max_rounds = min(3, max(len(wife_messages), len(husband_messages)))
+    for idx in range(max_rounds):
         if idx < len(wife_messages):
-            cards.append(_message_to_chat_card(wife_messages[idx], "wife_lawyer"))
+            cards.append(_message_to_chat_card(wife_messages[idx], "wife_lawyer", evidence_by_id))
         if idx < len(husband_messages):
-            cards.append(_message_to_chat_card(husband_messages[idx], "husband_lawyer"))
+            cards.append(_message_to_chat_card(husband_messages[idx], "husband_lawyer", evidence_by_id))
 
     cards.append(
         {
             "role": "mediator",
             "label": mediator_result.get("display_name") or "서장훈 에이전트",
-            "text": _short_text(realistic_advice, 140),
+            "text": _mediator_long_advice(mediator_result, realistic_advice, evidence_by_id),
             "stance": "mediation",
         }
     )
-    return cards[:9]
+    return cards
 
 
 def _issue_text(judge_result: dict, issue_type: str, fallback: str) -> str:
     for issue in judge_result.get("issue_analysis", []):
         if issue.get("issue_type") == issue_type:
-            return _short_text(issue.get("analysis") or issue.get("wife_position") or issue.get("husband_position"), 120)
+            return _clean_text(issue.get("analysis") or issue.get("wife_position") or issue.get("husband_position"))
     return fallback
+
+
+def _legal_basis_lookup() -> dict[str, str]:
+    try:
+        items = storage.load_legal_basis()
+    except FileNotFoundError:
+        items = []
+    return {
+        str(item.get("legal_basis_id")): " ".join(
+            part
+            for part in [
+                str(item.get("law_name") or ""),
+                str(item.get("article_number") or ""),
+                str(item.get("title") or ""),
+            ]
+            if part
+        )
+        for item in items
+        if item.get("legal_basis_id")
+    }
+
+
+def _judge_preview_text(judge_result: dict) -> str:
+    issues = judge_result.get("issue_analysis", [])
+    if not issues:
+        return _clean_text(judge_result.get("summary") or "법적 쟁점을 정리하고 있습니다.")
+
+    legal_by_id = _legal_basis_lookup()
+    legal_ids = []
+    for issue in issues:
+        for basis_id in issue.get("legal_basis_ids", []):
+            basis_id = str(basis_id)
+            if basis_id not in legal_ids:
+                legal_ids.append(basis_id)
+
+    legal_refs = []
+    for basis_id in legal_ids[:6]:
+        label = legal_by_id.get(basis_id, basis_id)
+        if label not in legal_refs:
+            legal_refs.append(label)
+
+    issue_lines = []
+    for issue in issues[:3]:
+        title = issue.get("issue_title") or issue.get("issue_type") or "법적 쟁점"
+        analysis = _clean_text(issue.get("analysis") or issue.get("wife_position") or issue.get("husband_position"))
+        if analysis:
+            issue_lines.append(f"{title}: {analysis}")
+
+    refs = ", ".join(legal_refs)
+    prefix = f"Legal RAG 기준으로 다음 법리를 참고했습니다: {refs}. " if refs else ""
+    return prefix + " ".join(issue_lines)
+
+
+def _discussion_result_text(agent_discussion: dict, judge_result: dict) -> str:
+    disputes = [_clean_text(item) for item in agent_discussion.get("remaining_disputes", []) if _clean_text(item)]
+    missing = [_clean_text(item) for item in agent_discussion.get("missing_evidence", []) if _clean_text(item)]
+    parts = []
+    if disputes:
+        parts.append("남은 쟁점: " + " / ".join(disputes[:5]))
+    if missing:
+        parts.append("추가 확인 자료: " + " / ".join(missing[:4]))
+    if judge_result.get("summary"):
+        parts.append("판사 쟁점 정리: " + _clean_text(judge_result.get("summary")))
+    return "\n".join(parts) or "양측 주장과 반박을 종합했습니다."
 
 
 def _estimate_monthly_child_support(evidence_items: list) -> str:
@@ -306,6 +464,7 @@ def build_frontend_flow(
 ) -> dict:
     wife_claim = _first_claim(wife_result)
     husband_claim = _first_claim(husband_result)
+    evidence_by_id = _evidence_lookup(evidence_items)
     mediator_actions = mediator_result.get("next_actions", [])
     realistic_advice = (
         mediator_result.get("balanced_reframe", [None])[0]
@@ -336,6 +495,7 @@ def build_frontend_flow(
         "day3": {
             "title": "AI Agent 토론",
             "chat_cards": _discussion_chat_cards(
+                evidence_items=evidence_items,
                 wife_result=wife_result,
                 husband_result=husband_result,
                 agent_discussion=agent_discussion,
@@ -344,17 +504,17 @@ def build_frontend_flow(
             ),
             "judge_preview": {
                 "label": "가정법원 판사",
-                "text": _short_text(judge_summary, 120),
+                "text": _judge_preview_text(judge_result),
             },
             "discussion_result": {
                 "label": "토론 결과",
-                "text": _short_text("; ".join(agent_discussion.get("remaining_disputes", [])) or judge_summary, 120),
+                "text": _discussion_result_text(agent_discussion, judge_result),
             },
         },
         "day4": {
             "title": "갈등 정산 리포트",
             "status": "REPORT COMPLETE",
-            "realistic_advice": _short_text(realistic_advice, 120),
+            "realistic_advice": _mediator_long_advice(mediator_result, realistic_advice, evidence_by_id),
             "simulation": {
                 "custody": _issue_text(judge_result, "custody", "현 증거 기준 양육 관련 추가 검토 필요"),
                 "child_support": _estimate_monthly_child_support(evidence_items),
