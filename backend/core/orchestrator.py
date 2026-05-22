@@ -2,7 +2,7 @@ from collections import defaultdict
 from typing import Any
 
 from agents import husband_lawyer_agent, judge_agent, mediator_agent, wife_lawyer_agent
-from core.evidence_builder import build_evidence
+from core.evidence_builder import build_evidence_from_documents, extract_documents
 from services.pinecone_service import PineconeService
 from services.storage_service import StorageService
 from services.upstage_service import UpstageService
@@ -183,6 +183,97 @@ def _first_claim(result: dict) -> dict:
     return claims[0] if claims and isinstance(claims[0], dict) else {}
 
 
+def _role_from_speaker(speaker: Any, fallback: str = "wife_lawyer") -> str:
+    text = str(speaker or "")
+    if "남편" in text or "Husband" in text:
+        return "husband_lawyer"
+    if "조정" in text or "중재" in text or "Mediator" in text or "서장훈" in text:
+        return "mediator"
+    return fallback
+
+
+def _evidence_suffix(evidence_ids: list) -> str:
+    ids = [str(item) for item in evidence_ids or [] if item]
+    return f" 근거: {', '.join(ids[:3])}" if ids else ""
+
+
+def _claim_to_chat_card(role: str, label: str, claim: dict, fallback: str) -> dict:
+    evidence_ids = claim.get("evidence_ids", []) if isinstance(claim, dict) else []
+    text = claim.get("claim") if isinstance(claim, dict) else ""
+    return {
+        "role": role,
+        "label": label,
+        "text": _short_text((text or fallback) + _evidence_suffix(evidence_ids), 120),
+        "evidence_ids": evidence_ids,
+        "stance": "opening",
+    }
+
+
+def _message_to_chat_card(message: dict, fallback_role: str) -> dict:
+    role = _role_from_speaker(message.get("speaker"), fallback_role)
+    label = "남편 측 변호사" if role == "husband_lawyer" else "아내 측 변호사"
+    evidence_ids = message.get("evidence_ids", [])
+    stance = message.get("stance", "rebuttal")
+    prefix = {
+        "rebuttal": "반박",
+        "concession": "일부 인정",
+        "clarification": "쟁점 정리",
+        "missing_evidence": "추가 증거 필요",
+    }.get(stance, "반박")
+    text = f"{prefix}: {message.get('content', '')}{_evidence_suffix(evidence_ids)}"
+    return {
+        "role": role,
+        "label": label,
+        "text": _short_text(text, 125),
+        "evidence_ids": evidence_ids,
+        "stance": stance,
+        "strength": message.get("strength"),
+        "responds_to_claim_ids": message.get("responds_to_claim_ids", []),
+    }
+
+
+def _discussion_chat_cards(
+    wife_result: dict,
+    husband_result: dict,
+    agent_discussion: dict,
+    mediator_result: dict,
+    realistic_advice: str,
+) -> list[dict]:
+    wife_claim = _first_claim(wife_result)
+    husband_claim = _first_claim(husband_result)
+    cards = [
+        _claim_to_chat_card("wife_lawyer", "아내 측 변호사", wife_claim, wife_result.get("summary", "")),
+        _claim_to_chat_card("husband_lawyer", "남편 측 변호사", husband_claim, husband_result.get("summary", "")),
+    ]
+
+    wife_messages = []
+    husband_messages = []
+    for message in agent_discussion.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        role = _role_from_speaker(message.get("speaker"))
+        if role == "husband_lawyer":
+            husband_messages.append(message)
+        else:
+            wife_messages.append(message)
+
+    for idx in range(max(len(wife_messages), len(husband_messages))):
+        if idx < len(wife_messages):
+            cards.append(_message_to_chat_card(wife_messages[idx], "wife_lawyer"))
+        if idx < len(husband_messages):
+            cards.append(_message_to_chat_card(husband_messages[idx], "husband_lawyer"))
+
+    cards.append(
+        {
+            "role": "mediator",
+            "label": mediator_result.get("display_name") or "서장훈 에이전트",
+            "text": _short_text(realistic_advice, 140),
+            "stance": "mediation",
+        }
+    )
+    return cards[:9]
+
+
 def _issue_text(judge_result: dict, issue_type: str, fallback: str) -> str:
     for issue in judge_result.get("issue_analysis", []):
         if issue.get("issue_type") == issue_type:
@@ -244,25 +335,13 @@ def build_frontend_flow(
         },
         "day3": {
             "title": "AI Agent 토론",
-            "chat_cards": [
-                {
-                    "role": "wife_lawyer",
-                    "label": "아내 측 변호사",
-                    "text": _short_text(wife_claim.get("claim") or wife_result.get("summary"), 130),
-                    "evidence_ids": wife_claim.get("evidence_ids", []),
-                },
-                {
-                    "role": "husband_lawyer",
-                    "label": "남편 측 변호사",
-                    "text": _short_text(husband_claim.get("claim") or husband_result.get("summary"), 130),
-                    "evidence_ids": husband_claim.get("evidence_ids", []),
-                },
-                {
-                    "role": "mediator",
-                    "label": mediator_result.get("display_name") or "서장훈 에이전트",
-                    "text": _short_text(realistic_advice, 140),
-                },
-            ],
+            "chat_cards": _discussion_chat_cards(
+                wife_result=wife_result,
+                husband_result=husband_result,
+                agent_discussion=agent_discussion,
+                mediator_result=mediator_result,
+                realistic_advice=realistic_advice,
+            ),
             "judge_preview": {
                 "label": "가정법원 판사",
                 "text": _short_text(judge_summary, 120),
@@ -344,11 +423,10 @@ async def run_case(case_id: str):
     case_info = storage.load_case_info(case_id)
     uploaded_files = storage.load_uploaded_files(case_id)
 
-    evidence_items = await build_evidence(
-        case_id=case_id,
-        uploaded_files=uploaded_files,
-        upstage_service=upstage,
-    )
+    extracted_documents = await extract_documents(uploaded_files, upstage)
+    storage.save_json(case_id, "ocr_extracted_documents.json", extracted_documents)
+
+    evidence_items = await build_evidence_from_documents(case_id, extracted_documents, upstage)
     storage.save_json(case_id, "evidence.json", evidence_items)
 
     pinecone_evidence_result = await pinecone_service.upsert_evidence(case_id, evidence_items)

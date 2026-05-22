@@ -73,6 +73,17 @@ async def get_uploaded_files(case_id: str):
         raise HTTPException(status_code=404, detail="case_id not found") from exc
 
 
+@app.get("/cases/{case_id}/ocr")
+async def get_ocr_extracted_documents(case_id: str):
+    try:
+        return {
+            "case_id": case_id,
+            "documents": storage.load_json(case_id, "ocr_extracted_documents.json"),
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="ocr_extracted_documents.json not found") from exc
+
+
 @app.post("/legal/init")
 async def init_legal_knowledge():
     try:

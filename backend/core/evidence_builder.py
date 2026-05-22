@@ -64,9 +64,8 @@ def mask_sensitive(text: str) -> str:
         return ""
     masked = re.sub(r"\b\d{6}-\d{7}\b", "******-*******", text)
     masked = re.sub(r"\b01[016789]-?\d{3,4}-?\d{4}\b", "010-****-****", masked)
-    masked = re.sub(r"\b\d{2,4}-\d{2,4}-\d{4,}\b", "****-****-****", masked)
+    masked = re.sub(r"\b0\d{1,2}-?\d{3,4}-?\d{4}\b", "****-****-****", masked)
     masked = re.sub(r"\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b", "****-****-****-****", masked)
-    masked = re.sub(r"\b\d{2,6}-\d{2,6}-\d{2,8}\b", "****-****-****", masked)
     return masked
 
 
@@ -200,11 +199,18 @@ def _normalize_items(case_id: str, result: dict, documents: list[dict[str, Any]]
     return normalized or _fallback_evidence(case_id, documents)
 
 
-async def build_evidence(case_id: str, uploaded_files: list, upstage_service: UpstageService) -> list:
+async def extract_documents(uploaded_files: list, upstage_service: UpstageService) -> list[dict[str, Any]]:
     documents = []
     for file_info in uploaded_files:
         documents.append(await _extract_file_text(file_info, upstage_service))
+    return documents
 
+
+async def build_evidence_from_documents(
+    case_id: str,
+    documents: list[dict[str, Any]],
+    upstage_service: UpstageService,
+) -> list:
     if not documents:
         return []
 
@@ -220,3 +226,8 @@ async def build_evidence(case_id: str, uploaded_files: list, upstage_service: Up
     if result.get("fallback"):
         return _fallback_evidence(case_id, documents)
     return _normalize_items(case_id, result, documents)
+
+
+async def build_evidence(case_id: str, uploaded_files: list, upstage_service: UpstageService) -> list:
+    documents = await extract_documents(uploaded_files, upstage_service)
+    return await build_evidence_from_documents(case_id, documents, upstage_service)
