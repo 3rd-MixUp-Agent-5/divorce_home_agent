@@ -402,24 +402,7 @@ def _discussion_chat_cards(
     realistic_advice: str,
 ) -> list[dict]:
     evidence_by_id = _evidence_lookup(evidence_items)
-    wife_claim = _first_claim(wife_result)
-    husband_claim = _first_claim(husband_result)
-    cards = [
-        _claim_to_chat_card(
-            "wife_lawyer",
-            "아내 측 변호사",
-            wife_claim,
-            wife_result.get("summary", ""),
-            evidence_by_id,
-        ),
-        _claim_to_chat_card(
-            "husband_lawyer",
-            "남편 측 변호사",
-            husband_claim,
-            husband_result.get("summary", ""),
-            evidence_by_id,
-        ),
-    ]
+    cards = []
 
     wife_messages = []
     husband_messages = []
@@ -434,10 +417,39 @@ def _discussion_chat_cards(
 
     max_rounds = min(3, max(len(wife_messages), len(husband_messages)))
     for idx in range(max_rounds):
+        round_label = f"{idx + 1}차 공방"
         if idx < len(wife_messages):
-            cards.append(_message_to_chat_card(wife_messages[idx], "wife_lawyer", evidence_by_id))
+            card = _message_to_chat_card(wife_messages[idx], "wife_lawyer", evidence_by_id)
+            card["label"] = f"{round_label} · 아내 측 변호사"
+            card["round"] = idx + 1
+            cards.append(card)
         if idx < len(husband_messages):
-            cards.append(_message_to_chat_card(husband_messages[idx], "husband_lawyer", evidence_by_id))
+            card = _message_to_chat_card(husband_messages[idx], "husband_lawyer", evidence_by_id)
+            card["label"] = f"{round_label} · 남편 측 변호사"
+            card["round"] = idx + 1
+            cards.append(card)
+
+    if not cards:
+        wife_claim = _first_claim(wife_result)
+        husband_claim = _first_claim(husband_result)
+        cards.extend(
+            [
+                _claim_to_chat_card(
+                    "wife_lawyer",
+                    "기초 주장 · 아내 측 변호사",
+                    wife_claim,
+                    wife_result.get("summary", ""),
+                    evidence_by_id,
+                ),
+                _claim_to_chat_card(
+                    "husband_lawyer",
+                    "기초 주장 · 남편 측 변호사",
+                    husband_claim,
+                    husband_result.get("summary", ""),
+                    evidence_by_id,
+                ),
+            ]
+        )
 
     cards.append(
         {
